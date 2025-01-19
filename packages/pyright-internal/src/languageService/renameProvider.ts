@@ -9,27 +9,29 @@
 
 import { CancellationToken, WorkspaceEdit } from 'vscode-languageserver';
 
+import { isUserCode } from '../analyzer/sourceFileInfoUtils';
+import { throwIfCancellationRequested } from '../common/cancellationUtils';
 import { assertNever } from '../common/debug';
 import { FileEditAction } from '../common/editAction';
 import { ProgramView, ReferenceUseCase } from '../common/extensibility';
 import { convertTextRangeToRange } from '../common/positionUtils';
 import { Position, Range } from '../common/textRange';
-import { ReferencesProvider, ReferencesResult } from '../languageService/referencesProvider';
-import { isUserCode } from '../analyzer/sourceFileInfoUtils';
-import { throwIfCancellationRequested } from '../common/cancellationUtils';
-import { ParseResults } from '../parser/parser';
+import { Uri } from '../common/uri/uri';
 import { convertToWorkspaceEdit } from '../common/workspaceEditUtils';
+import { ReferencesProvider, ReferencesResult } from '../languageService/referencesProvider';
+import { ParseNodeType } from '../parser/parseNodes';
+import { ParseFileResults } from '../parser/parser';
 
 export class RenameProvider {
-    private readonly _parseResults: ParseResults | undefined;
+    private readonly _parseResults: ParseFileResults | undefined;
 
     constructor(
         private _program: ProgramView,
-        private _filePath: string,
+        private _fileUri: Uri,
         private _position: Position,
         private _token: CancellationToken
     ) {
-        this._parseResults = this._program.getParseResults(this._filePath);
+        this._parseResults = this._program.getParseResults(this._fileUri);
     }
 
     canRenameSymbol(isDefaultWorkspace: boolean, isUntitled: boolean): Range | null {
@@ -45,7 +47,7 @@ export class RenameProvider {
 
         const renameMode = RenameProvider.getRenameSymbolMode(
             this._program,
-            this._filePath,
+            this._fileUri,
             referencesResult,
             isDefaultWorkspace,
             isUntitled
@@ -72,7 +74,7 @@ export class RenameProvider {
         const referenceProvider = new ReferencesProvider(this._program, this._token);
         const renameMode = RenameProvider.getRenameSymbolMode(
             this._program,
-            this._filePath,
+            this._fileUri,
             referencesResult,
             isDefaultWorkspace,
             isUntitled
@@ -80,11 +82,7 @@ export class RenameProvider {
 
         switch (renameMode) {
             case 'singleFileMode':
-                referenceProvider.addReferencesToResult(
-                    this._filePath,
-                    /* includeDeclaration */ true,
-                    referencesResult
-                );
+                referenceProvider.addReferencesToResult(this._fileUri, /* includeDeclaration */ true, referencesResult);
                 break;
 
             case 'multiFileMode': {
@@ -99,7 +97,7 @@ export class RenameProvider {
                         }
 
                         referenceProvider.addReferencesToResult(
-                            curSourceFileInfo.sourceFile.getFilePath(),
+                            curSourceFileInfo.sourceFile.getUri(),
                             /* includeDeclaration */ true,
                             referencesResult
                         );
@@ -122,11 +120,30 @@ export class RenameProvider {
         }
 
         const edits: FileEditAction[] = [];
-        referencesResult.locations.forEach((loc) => {
+        referencesResult.results.forEach((result) => {
+            // Special case the renames of keyword arguments.
+            const node = result.node;
+            let range = result.location.range;
+            let replacementText = newName;
+
+            if (
+                node.nodeType === ParseNodeType.Name &&
+                node.parent?.nodeType === ParseNodeType.Argument &&
+                node.parent.d.isNameSameAsValue &&
+                result.parentRange
+            ) {
+                range = result.parentRange;
+                if (node === node.parent.d.valueExpr) {
+                    replacementText = `${node.d.value}=${newName}`;
+                } else {
+                    replacementText = `${newName}=${node.d.value}`;
+                }
+            }
+
             edits.push({
-                filePath: loc.path,
-                range: loc.range,
-                replacementText: newName,
+                fileUri: result.location.uri,
+                range,
+                replacementText,
             });
         });
 
@@ -135,12 +152,12 @@ export class RenameProvider {
 
     static getRenameSymbolMode(
         program: ProgramView,
-        filePath: string,
+        fileUri: Uri,
         referencesResult: ReferencesResult,
         isDefaultWorkspace: boolean,
         isUntitled: boolean
     ) {
-        const sourceFileInfo = program.getSourceFileInfo(filePath)!;
+        const sourceFileInfo = program.getSourceFileInfo(fileUri)!;
 
         // We have 2 different cases
         // Single file mode.
@@ -156,12 +173,12 @@ export class RenameProvider {
             (userFile && !referencesResult.requiresGlobalSearch) ||
             (!userFile &&
                 sourceFileInfo.isOpenByClient &&
-                referencesResult.declarations.every((d) => program.getSourceFileInfo(d.path) === sourceFileInfo))
+                referencesResult.declarations.every((d) => program.getSourceFileInfo(d.uri) === sourceFileInfo))
         ) {
             return 'singleFileMode';
         }
 
-        if (!isUntitled && referencesResult.declarations.every((d) => isUserCode(program.getSourceFileInfo(d.path)))) {
+        if (referencesResult.declarations.every((d) => isUserCode(program.getSourceFileInfo(d.uri)))) {
             return 'multiFileMode';
         }
 
@@ -173,7 +190,7 @@ export class RenameProvider {
     private _getReferenceResult() {
         const referencesResult = ReferencesProvider.getDeclarationForPosition(
             this._program,
-            this._filePath,
+            this._fileUri,
             this._position,
             /* reporter */ undefined,
             ReferenceUseCase.Rename,

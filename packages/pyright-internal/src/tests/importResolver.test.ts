@@ -8,6 +8,7 @@ import assert from 'assert';
 
 import { Dirent, ReadStream, WriteStream } from 'fs';
 import { ImportResolver } from '../analyzer/importResolver';
+import { ImportType } from '../analyzer/importResult';
 import { ConfigOptions } from '../common/configOptions';
 import { FileSystem, MkDirOptions, Stats } from '../common/fileSystem';
 import { FileWatcher, FileWatcherEventHandler } from '../common/fileWatcher';
@@ -15,9 +16,12 @@ import { FullAccessHost } from '../common/fullAccessHost';
 import { Host } from '../common/host';
 import { lib, sitePackages, typeshedFallback } from '../common/pathConsts';
 import { combinePaths, getDirectoryPath, normalizeSlashes } from '../common/pathUtils';
-import { createFromRealFileSystem } from '../common/realFileSystem';
+import { createFromRealFileSystem, RealTempFile } from '../common/realFileSystem';
+import { ServiceKeys } from '../common/serviceKeys';
 import { ServiceProvider } from '../common/serviceProvider';
 import { createServiceProvider } from '../common/serviceProviderExtensions';
+import { Uri } from '../common/uri/uri';
+import { UriEx } from '../common/uri/uriUtils';
 import { PyrightFileSystem } from '../pyrightFileSystem';
 import { TestAccessHost } from './harness/testAccessHost';
 import { TestFileSystem } from './harness/vfs/filesystem';
@@ -51,8 +55,9 @@ if (!usingTrueVenv()) {
             assert(importResult.isStubFile);
             assert.strictEqual(
                 1,
-                importResult.resolvedPaths.filter((f) => f === combinePaths(libraryRoot, 'myLib', 'partialStub.pyi'))
-                    .length
+                importResult.resolvedUris.filter(
+                    (f) => !f.isEmpty() && f.getFilePath() === combinePaths(libraryRoot, 'myLib', 'partialStub.pyi')
+                ).length
             );
         });
 
@@ -77,8 +82,9 @@ if (!usingTrueVenv()) {
             assert(importResult.isStubFile);
             assert.strictEqual(
                 1,
-                importResult.resolvedPaths.filter((f) => f === combinePaths(libraryRoot, 'myLib', '__init__.pyi'))
-                    .length
+                importResult.resolvedUris.filter(
+                    (f) => f.getFilePath() === combinePaths(libraryRoot, 'myLib', '__init__.pyi')
+                ).length
             );
         });
 
@@ -120,13 +126,14 @@ if (!usingTrueVenv()) {
                 },
             ];
 
-            const importResult = getImportResult(files, ['myLib'], (c) => (c.stubPath = typingFolder));
+            const importResult = getImportResult(files, ['myLib'], (c) => (c.stubPath = UriEx.file(typingFolder)));
             assert(importResult.isImportFound);
             assert(importResult.isStubFile);
             assert.strictEqual(
                 1,
-                importResult.resolvedPaths.filter((f) => f === combinePaths(libraryRoot, 'myLib', '__init__.pyi'))
-                    .length
+                importResult.resolvedUris.filter(
+                    (f) => f.getFilePath() === combinePaths(libraryRoot, 'myLib', '__init__.pyi')
+                ).length
             );
         });
 
@@ -152,13 +159,18 @@ if (!usingTrueVenv()) {
             ];
 
             // Stub packages win over typeshed.
-            const importResult = getImportResult(files, ['myLib'], (c) => (c.typeshedPath = typeshedFolder));
+            const importResult = getImportResult(
+                files,
+                ['myLib'],
+                (c) => (c.typeshedPath = UriEx.file(typeshedFolder))
+            );
             assert(importResult.isImportFound);
             assert(importResult.isStubFile);
             assert.strictEqual(
                 1,
-                importResult.resolvedPaths.filter((f) => f === combinePaths(libraryRoot, 'myLib', '__init__.pyi'))
-                    .length
+                importResult.resolvedUris.filter(
+                    (f) => f.getFilePath() === combinePaths(libraryRoot, 'myLib', '__init__.pyi')
+                ).length
             );
         });
 
@@ -188,8 +200,9 @@ if (!usingTrueVenv()) {
             assert(importResult.isStubFile);
             assert.strictEqual(
                 1,
-                importResult.resolvedPaths.filter((f) => f === combinePaths(libraryRoot, 'myLib', '__init__.pyi'))
-                    .length
+                importResult.resolvedUris.filter(
+                    (f) => f.getFilePath() === combinePaths(libraryRoot, 'myLib', '__init__.pyi')
+                ).length
             );
         });
 
@@ -237,7 +250,10 @@ if (!usingTrueVenv()) {
 
             const importResult = getImportResult(files, ['os']);
             assert(importResult.isImportFound);
-            assert.strictEqual(files[0].path, importResult.resolvedPaths[importResult.resolvedPaths.length - 1]);
+            assert.strictEqual(
+                files[0].path,
+                importResult.resolvedUris[importResult.resolvedUris.length - 1].getFilePath()
+            );
         });
 
         test('import side by side file sub under lib folder', () => {
@@ -256,7 +272,42 @@ if (!usingTrueVenv()) {
             assert(!importResult.isImportFound);
         });
     });
+
+    test('getModuleNameForImport library file', () => {
+        const files = [
+            {
+                path: combinePaths(libraryRoot, 'myLib', 'myModule', 'file1.py'),
+                content: '# empty',
+            },
+        ];
+
+        const moduleImportInfo = getModuleNameForImport(files);
+
+        assert.strictEqual(moduleImportInfo.importType, ImportType.ThirdParty);
+        assert(!moduleImportInfo.isThirdPartyPyTypedPresent);
+        assert(!moduleImportInfo.isLocalTypingsFile);
+    });
+
+    test('getModuleNameForImport py.typed library file', () => {
+        const files = [
+            {
+                path: combinePaths(libraryRoot, 'myLib', 'py.typed'),
+                content: '',
+            },
+            {
+                path: combinePaths(libraryRoot, 'myLib', 'myModule', 'file1.py'),
+                content: '# empty',
+            },
+        ];
+
+        const moduleImportInfo = getModuleNameForImport(files);
+
+        assert.strictEqual(moduleImportInfo.importType, ImportType.ThirdParty);
+        assert(moduleImportInfo.isThirdPartyPyTypedPresent);
+        assert(!moduleImportInfo.isLocalTypingsFile);
+    });
 }
+
 describe('Import tests that can run with or without a true venv', () => {
     test('side by side files', () => {
         const myFile = combinePaths('src', 'file.py');
@@ -292,15 +343,16 @@ describe('Import tests that can run with or without a true venv', () => {
         ];
 
         const sp = createServiceProviderFromFiles(files);
-        const configOptions = new ConfigOptions(normalizeSlashes('/'));
+        const configOptions = new ConfigOptions(UriEx.file('/'));
         const importResolver = new ImportResolver(
             sp,
             configOptions,
-            new TestAccessHost(sp.fs().getModulePath(), [libraryRoot])
+            new TestAccessHost(sp.fs().getModulePath(), [UriEx.file(libraryRoot)])
         );
 
         // Stub package wins over original package (per PEP 561 rules).
-        const sideBySideResult = importResolver.resolveImport(myFile, configOptions.findExecEnvironment(myFile), {
+        const myUri = UriEx.file(myFile);
+        const sideBySideResult = importResolver.resolveImport(myUri, configOptions.findExecEnvironment(myUri), {
             leadingDots: 0,
             nameParts: ['myLib', 'partialStub'],
             importedSymbols: new Set<string>(),
@@ -309,12 +361,12 @@ describe('Import tests that can run with or without a true venv', () => {
         assert(sideBySideResult.isImportFound);
         assert(sideBySideResult.isStubFile);
 
-        const sideBySideStubFile = combinePaths(libraryRoot, 'myLib', 'partialStub.pyi');
-        assert.strictEqual(1, sideBySideResult.resolvedPaths.filter((f) => f === sideBySideStubFile).length);
+        const sideBySideStubFile = UriEx.file(combinePaths(libraryRoot, 'myLib', 'partialStub.pyi'));
+        assert.strictEqual(1, sideBySideResult.resolvedUris.filter((f) => f.key === sideBySideStubFile.key).length);
         assert.strictEqual('def test(): ...', sp.fs().readFileSync(sideBySideStubFile, 'utf8'));
 
         // Side by side stub doesn't completely disable partial stub.
-        const partialStubResult = importResolver.resolveImport(myFile, configOptions.findExecEnvironment(myFile), {
+        const partialStubResult = importResolver.resolveImport(myUri, configOptions.findExecEnvironment(myUri), {
             leadingDots: 0,
             nameParts: ['myLib', 'partialStub2'],
             importedSymbols: new Set<string>(),
@@ -323,8 +375,8 @@ describe('Import tests that can run with or without a true venv', () => {
         assert(partialStubResult.isImportFound);
         assert(partialStubResult.isStubFile);
 
-        const partialStubFile = combinePaths(libraryRoot, 'myLib', 'partialStub2.pyi');
-        assert.strictEqual(1, partialStubResult.resolvedPaths.filter((f) => f === partialStubFile).length);
+        const partialStubFile = UriEx.file(combinePaths(libraryRoot, 'myLib', 'partialStub2.pyi'));
+        assert.strictEqual(1, partialStubResult.resolvedUris.filter((f) => f.key === partialStubFile.key).length);
     });
 
     test('stub namespace package', () => {
@@ -345,7 +397,41 @@ describe('Import tests that can run with or without a true venv', () => {
         assert(!importResult.isStubFile);
         assert.strictEqual(
             1,
-            importResult.resolvedPaths.filter((f) => f === combinePaths(libraryRoot, 'myLib', 'partialStub.py')).length
+            importResult.resolvedUris.filter(
+                (f) => !f.isEmpty() && f.getFilePath() === combinePaths(libraryRoot, 'myLib', 'partialStub.py')
+            ).length
+        );
+    });
+
+    test('py.typed namespace package plus stubs', () => {
+        const typingFolder = combinePaths(normalizeSlashes('/'), 'typing');
+        const files = [
+            {
+                path: combinePaths(typingFolder, 'myLib/core', 'foo.pyi'),
+                content: 'def test(): pass',
+            },
+            {
+                path: combinePaths(libraryRoot, 'myLib', 'py.typed'),
+                content: '',
+            },
+            {
+                path: combinePaths(libraryRoot, 'myLib', '__init__.py'),
+                content: 'def test(): pass',
+            },
+            {
+                path: combinePaths(libraryRoot, 'myLib', '__init__.pyi'),
+                content: 'def test(): pass',
+            },
+        ];
+
+        const importResult = getImportResult(files, ['myLib'], (c) => (c.stubPath = UriEx.file(typingFolder)));
+        assert(importResult.isImportFound);
+        assert(importResult.isStubFile);
+        assert.strictEqual(
+            1,
+            importResult.resolvedUris.filter(
+                (f) => !f.isEmpty() && f.getFilePath() === combinePaths(libraryRoot, 'myLib', '__init__.pyi')
+            ).length
         );
     });
 
@@ -371,12 +457,14 @@ describe('Import tests that can run with or without a true venv', () => {
         ];
 
         // If the package exists in typing folder, that gets picked up first.
-        const importResult = getImportResult(files, ['myLib'], (c) => (c.stubPath = typingFolder));
+        const importResult = getImportResult(files, ['myLib'], (c) => (c.stubPath = UriEx.file(typingFolder)));
         assert(importResult.isImportFound);
         assert(importResult.isStubFile);
         assert.strictEqual(
             0,
-            importResult.resolvedPaths.filter((f) => f === combinePaths(libraryRoot, 'myLib', '__init__.pyi')).length
+            importResult.resolvedUris.filter(
+                (f) => f.getFilePath() === combinePaths(libraryRoot, 'myLib', '__init__.pyi')
+            ).length
         );
     });
 
@@ -394,16 +482,19 @@ describe('Import tests that can run with or without a true venv', () => {
 
         const importResult = getImportResult(files, ['os']);
         assert(importResult.isImportFound);
-        assert.strictEqual(files[1].path, importResult.resolvedPaths[importResult.resolvedPaths.length - 1]);
+        assert.strictEqual(
+            files[1].path,
+            importResult.resolvedUris[importResult.resolvedUris.length - 1].getFilePath()
+        );
     });
 
     test('no empty import roots', () => {
         const sp = createServiceProviderFromFiles([]);
-        const configOptions = new ConfigOptions(''); // Empty, like open-file mode.
+        const configOptions = new ConfigOptions(Uri.empty()); // Empty, like open-file mode.
         const importResolver = new ImportResolver(
             sp,
             configOptions,
-            new TestAccessHost(sp.fs().getModulePath(), [libraryRoot])
+            new TestAccessHost(sp.fs().getModulePath(), [UriEx.file(libraryRoot)])
         );
         importResolver.getImportRoots(configOptions.getDefaultExecEnvironment()).forEach((path) => assert(path));
     });
@@ -421,21 +512,25 @@ describe('Import tests that can run with or without a true venv', () => {
         ];
 
         const sp = createServiceProviderFromFiles(files);
-        const configOptions = new ConfigOptions(''); // Empty, like open-file mode.
+        const configOptions = new ConfigOptions(Uri.empty()); // Empty, like open-file mode.
         const importResolver = new ImportResolver(
             sp,
             configOptions,
-            new TestAccessHost(sp.fs().getModulePath(), [libraryRoot])
+            new TestAccessHost(sp.fs().getModulePath(), [UriEx.file(libraryRoot)])
         );
         const importRoots = importResolver.getImportRoots(configOptions.getDefaultExecEnvironment());
 
         assert.strictEqual(
             1,
-            importRoots.filter((f) => f === combinePaths('/', typeshedFallback, 'stubs', 'aLib')).length
+            importRoots.filter(
+                (f) => !f.isEmpty() && f.getFilePath() === combinePaths('/', typeshedFallback, 'stubs', 'aLib')
+            ).length
         );
         assert.strictEqual(
             1,
-            importRoots.filter((f) => f === combinePaths('/', typeshedFallback, 'stubs', 'bLib')).length
+            importRoots.filter(
+                (f) => !f.isEmpty() && f.getFilePath() === combinePaths('/', typeshedFallback, 'stubs', 'bLib')
+            ).length
         );
     });
 
@@ -453,7 +548,10 @@ describe('Import tests that can run with or without a true venv', () => {
 
         const importResult = getImportResult(files, ['file1']);
         assert(importResult.isImportFound);
-        assert.strictEqual(1, importResult.resolvedPaths.filter((f) => f === combinePaths('/', 'file1.py')).length);
+        assert.strictEqual(
+            1,
+            importResult.resolvedUris.filter((f) => f.getFilePath() === combinePaths('/', 'file1.py')).length
+        );
     });
 
     test('import side by side file sub folder', () => {
@@ -470,7 +568,10 @@ describe('Import tests that can run with or without a true venv', () => {
 
         const importResult = getImportResult(files, ['file1']);
         assert(importResult.isImportFound);
-        assert.strictEqual(1, importResult.resolvedPaths.filter((f) => f === combinePaths('/test', 'file1.py')).length);
+        assert.strictEqual(
+            1,
+            importResult.resolvedUris.filter((f) => f.getFilePath() === combinePaths('/test', 'file1.py')).length
+        );
     });
 
     test('import side by side file sub under src folder', () => {
@@ -489,7 +590,7 @@ describe('Import tests that can run with or without a true venv', () => {
         assert(importResult.isImportFound);
         assert.strictEqual(
             1,
-            importResult.resolvedPaths.filter((f) => f === combinePaths('/src/nested', 'file1.py')).length
+            importResult.resolvedUris.filter((f) => f.getFilePath() === combinePaths('/src/nested', 'file1.py')).length
         );
     });
 
@@ -509,7 +610,7 @@ describe('Import tests that can run with or without a true venv', () => {
         assert(importResult.isImportFound);
         assert.strictEqual(
             1,
-            importResult.resolvedPaths.filter((f) => f === combinePaths('/src/nested', 'file1.py')).length
+            importResult.resolvedUris.filter((f) => f.getFilePath() === combinePaths('/src/nested', 'file1.py')).length
         );
     });
 
@@ -521,7 +622,7 @@ describe('Import tests that can run with or without a true venv', () => {
             },
         ];
 
-        const importResult = getImportResult(files, ['notExist'], (c) => (c.projectRoot = ''));
+        const importResult = getImportResult(files, ['notExist'], (c) => (c.projectRoot = Uri.empty()));
         assert(!importResult.isImportFound);
     });
 
@@ -542,7 +643,10 @@ describe('Import tests that can run with or without a true venv', () => {
         ];
 
         const importResult = getImportResult(files, ['a', 'b', 'c', 'd'], (config) => {
-            config.defaultExtraPaths = [combinePaths('/', 'packages1'), combinePaths('/', 'packages2')];
+            config.defaultExtraPaths = [
+                UriEx.file(combinePaths('/', 'packages1')),
+                UriEx.file(combinePaths('/', 'packages2')),
+            ];
         });
         assert(importResult.isImportFound);
     });
@@ -564,7 +668,10 @@ describe('Import tests that can run with or without a true venv', () => {
         ];
 
         const importResult = getImportResult(files, ['a', 'b', 'c', 'd'], (config) => {
-            config.defaultExtraPaths = [combinePaths('/', 'packages1'), combinePaths('/', 'packages2')];
+            config.defaultExtraPaths = [
+                UriEx.file(combinePaths('/', 'packages1')),
+                UriEx.file(combinePaths('/', 'packages2')),
+            ];
         });
         assert(importResult.isImportFound);
     });
@@ -582,7 +689,10 @@ describe('Import tests that can run with or without a true venv', () => {
         ];
 
         const importResult = getImportResult(files, ['a', 'b', 'c', 'd'], (config) => {
-            config.defaultExtraPaths = [combinePaths('/', 'packages1'), combinePaths('/', 'packages2')];
+            config.defaultExtraPaths = [
+                UriEx.file(combinePaths('/', 'packages1')),
+                UriEx.file(combinePaths('/', 'packages2')),
+            ];
         });
         assert(!importResult.isImportFound);
     });
@@ -608,9 +718,45 @@ describe('Import tests that can run with or without a true venv', () => {
         ];
 
         const importResult = getImportResult(files, ['a', 'b', 'c'], (config) => {
-            config.defaultExtraPaths = [combinePaths('/', 'packages1'), combinePaths('/', 'packages2')];
+            config.defaultExtraPaths = [
+                UriEx.file(combinePaths('/', 'packages1')),
+                UriEx.file(combinePaths('/', 'packages2')),
+            ];
         });
         assert(!importResult.isImportFound);
+    });
+
+    test('default workspace importing side by side file', () => {
+        const files = [
+            {
+                path: combinePaths('/', 'src', 'a', 'b', 'file1.py'),
+                content: 'import file2',
+            },
+            {
+                path: combinePaths('/', 'src', 'a', 'b', 'file2.py'),
+                content: 'def f(): pass',
+            },
+        ];
+
+        const importResult = getImportResult(files, ['file2'], (config) => {
+            config.projectRoot = Uri.defaultWorkspace({ isCaseSensitive: () => true });
+        });
+        assert(importResult.isImportFound);
+    });
+
+    test('getModuleNameForImport user file', () => {
+        const files = [
+            {
+                path: combinePaths('/', 'src', 'file1.py'),
+                content: '# empty',
+            },
+        ];
+
+        const moduleImportInfo = getModuleNameForImport(files);
+
+        assert.strictEqual(moduleImportInfo.importType, ImportType.Local);
+        assert(!moduleImportInfo.isThirdPartyPyTypedPresent);
+        assert(!moduleImportInfo.isLocalTypingsFile);
     });
 });
 
@@ -635,7 +781,39 @@ function getImportResult(
     nameParts: string[],
     setup?: (c: ConfigOptions) => void
 ) {
-    const defaultHostFactory = (sp: ServiceProvider) => new TestAccessHost(sp.fs().getModulePath(), [libraryRoot]);
+    const { importResolver, uri, configOptions } = setupImportResolver(files, setup);
+
+    const importResult = importResolver.resolveImport(uri, configOptions.findExecEnvironment(uri), {
+        leadingDots: 0,
+        nameParts: nameParts,
+        importedSymbols: new Set<string>(),
+    });
+
+    // Add the config venvpath to the import result so we can output it on failure.
+    if (!importResult.isImportFound) {
+        importResult.importFailureInfo = importResult.importFailureInfo ?? [];
+        importResult.importFailureInfo.push(`venvPath: ${configOptions.venvPath}`);
+    }
+
+    return importResult;
+}
+
+function getModuleNameForImport(files: { path: string; content: string }[], setup?: (c: ConfigOptions) => void) {
+    const { importResolver, uri, configOptions } = setupImportResolver(files, setup);
+
+    const moduleImportInfo = importResolver.getModuleNameForImport(
+        uri,
+        configOptions.findExecEnvironment(uri),
+        undefined,
+        /* detectPyTyped */ true
+    );
+
+    return moduleImportInfo;
+}
+
+function setupImportResolver(files: { path: string; content: string }[], setup?: (c: ConfigOptions) => void) {
+    const defaultHostFactory = (sp: ServiceProvider) =>
+        new TestAccessHost(sp.fs().getModulePath(), [UriEx.file(libraryRoot)]);
     const defaultSetup =
         setup ??
         ((c) => {
@@ -652,31 +830,29 @@ function getImportResult(
     if (process.env.CI_IMPORT_TEST_VENVPATH) {
         configModifier = (c: ConfigOptions) => {
             defaultSetup(c);
-            c.venvPath = process.env.CI_IMPORT_TEST_VENVPATH;
+            c.venvPath = UriEx.file(
+                process.env.CI_IMPORT_TEST_VENVPATH!,
+                /* isCaseSensitive */ true,
+                /* checkRelative */ true
+            );
             c.venv = process.env.CI_IMPORT_TEST_VENV;
         };
         spFactory = (files: { path: string; content: string }[]) => createServiceProviderWithCombinedFs(files);
     } else if (process.env.CI_IMPORT_TEST_PYTHONPATH) {
         configModifier = (c: ConfigOptions) => {
             defaultSetup(c);
-            c.pythonPath = process.env.CI_IMPORT_TEST_PYTHONPATH;
+            c.pythonPath = UriEx.file(
+                process.env.CI_IMPORT_TEST_PYTHONPATH!,
+                /* isCaseSensitive */ true,
+                /* checkRelative */ true
+            );
         };
-        hostFactory = (sp: ServiceProvider) => new TruePythonTestAccessHost();
+        hostFactory = (sp: ServiceProvider) => new TruePythonTestAccessHost(sp);
         spFactory = (files: { path: string; content: string }[]) => createServiceProviderWithCombinedFs(files);
     }
 
-    return getImportResultImpl(files, nameParts, spFactory, configModifier, hostFactory);
-}
-
-function getImportResultImpl(
-    files: { path: string; content: string }[],
-    nameParts: string[],
-    spFactory: (files: { path: string; content: string }[]) => ServiceProvider,
-    configModifier: (c: ConfigOptions) => void,
-    hostFactory: (sp: ServiceProvider) => Host
-) {
     const sp = spFactory(files);
-    const configOptions = new ConfigOptions(normalizeSlashes('/'));
+    const configOptions = new ConfigOptions(UriEx.file('/'));
     configModifier(configOptions);
 
     const file = files.length > 0 ? files[files.length - 1].path : combinePaths('src', 'file.py');
@@ -687,15 +863,12 @@ function getImportResultImpl(
         });
     }
 
+    const uri = UriEx.file(file);
     const importResolver = new ImportResolver(sp, configOptions, hostFactory(sp));
-    const importResult = importResolver.resolveImport(file, configOptions.findExecEnvironment(file), {
-        leadingDots: 0,
-        nameParts: nameParts,
-        importedSymbols: new Set<string>(),
-    });
 
-    return importResult;
+    return { importResolver, uri, configOptions };
 }
+
 function createTestFileSystem(files: { path: string; content: string }[]): TestFileSystem {
     const fs = new TestFileSystem(/* ignoreCase */ false, { cwd: normalizeSlashes('/') });
 
@@ -704,149 +877,152 @@ function createTestFileSystem(files: { path: string; content: string }[]): TestF
         const dir = getDirectoryPath(path);
         fs.mkdirpSync(dir);
 
-        fs.writeFileSync(path, file.content);
+        fs.writeFileSync(UriEx.file(path), file.content);
     }
 
     return fs;
 }
+
 function createServiceProviderFromFiles(files: { path: string; content: string }[]): ServiceProvider {
-    const fs = new PyrightFileSystem(createTestFileSystem(files));
-    return createServiceProvider(fs);
+    const testFS = createTestFileSystem(files);
+    const fs = new PyrightFileSystem(testFS);
+    return createServiceProvider(testFS, fs);
 }
 
 function createServiceProviderWithCombinedFs(files: { path: string; content: string }[]): ServiceProvider {
-    const fs = new PyrightFileSystem(new CombinedFileSystem(createTestFileSystem(files)));
-    return createServiceProvider(fs);
+    const testFS = createTestFileSystem(files);
+    const fs = new PyrightFileSystem(new CombinedFileSystem(testFS));
+    return createServiceProvider(testFS, fs);
 }
 
 class TruePythonTestAccessHost extends FullAccessHost {
-    constructor() {
-        super(createFromRealFileSystem());
+    constructor(sp: ServiceProvider) {
+        // Make sure the service provide in use is using a real file system and real temporary file provider.
+        const clone = sp.clone();
+        clone.add(ServiceKeys.fs, createFromRealFileSystem(sp.get(ServiceKeys.caseSensitivityDetector)));
+        clone.add(ServiceKeys.tempFile, new RealTempFile());
+        super(clone);
     }
 }
 
 class CombinedFileSystem implements FileSystem {
-    private _realFS = createFromRealFileSystem();
+    private _realFS = createFromRealFileSystem(this._testFS);
 
-    constructor(private _testFS: FileSystem) {}
+    constructor(private _testFS: TestFileSystem) {}
 
-    mkdirSync(path: string, options?: MkDirOptions | undefined): void {
+    mkdirSync(path: Uri, options?: MkDirOptions | undefined): void {
         this._testFS.mkdirSync(path, options);
     }
 
-    writeFileSync(path: string, data: string | Buffer, encoding: BufferEncoding | null): void {
+    writeFileSync(path: Uri, data: string | Buffer, encoding: BufferEncoding | null): void {
         this._testFS.writeFileSync(path, data, encoding);
     }
 
-    unlinkSync(path: string): void {
+    unlinkSync(path: Uri): void {
         this._testFS.unlinkSync(path);
     }
 
-    rmdirSync(path: string): void {
+    rmdirSync(path: Uri): void {
         this._testFS.rmdirSync(path);
     }
 
-    createFileSystemWatcher(paths: string[], listener: FileWatcherEventHandler): FileWatcher {
+    createFileSystemWatcher(paths: Uri[], listener: FileWatcherEventHandler): FileWatcher {
         return this._testFS.createFileSystemWatcher(paths, listener);
     }
 
-    createReadStream(path: string): ReadStream {
+    createReadStream(path: Uri): ReadStream {
         return this._testFS.createReadStream(path);
     }
 
-    createWriteStream(path: string): WriteStream {
+    createWriteStream(path: Uri): WriteStream {
         return this._testFS.createWriteStream(path);
     }
 
-    copyFileSync(src: string, dst: string): void {
+    copyFileSync(src: Uri, dst: Uri): void {
         this._testFS.copyFileSync(src, dst);
     }
 
-    existsSync(path: string): boolean {
+    existsSync(path: Uri): boolean {
         return this._testFS.existsSync(path) || this._realFS.existsSync(path);
     }
 
-    chdir(path: string): void {
+    chdir(path: Uri): void {
         this._testFS.chdir(path);
     }
 
-    readdirEntriesSync(path: string): Dirent[] {
+    readdirEntriesSync(path: Uri): Dirent[] {
         if (this._testFS.existsSync(path)) {
             return this._testFS.readdirEntriesSync(path);
         }
         return this._realFS.readdirEntriesSync(path);
     }
 
-    readdirSync(path: string): string[] {
+    readdirSync(path: Uri): string[] {
         if (this._testFS.existsSync(path)) {
             return this._testFS.readdirSync(path);
         }
         return this._realFS.readdirSync(path);
     }
 
-    readFileSync(path: string, encoding?: null): Buffer;
-    readFileSync(path: string, encoding: BufferEncoding): string;
-    readFileSync(path: string, encoding?: BufferEncoding | null): string | Buffer;
-    readFileSync(path: string, encoding: BufferEncoding | null = null) {
+    readFileSync(path: Uri, encoding?: null): Buffer;
+    readFileSync(path: Uri, encoding: BufferEncoding): string;
+    readFileSync(path: Uri, encoding?: BufferEncoding | null): string | Buffer;
+    readFileSync(path: Uri, encoding: BufferEncoding | null = null) {
         if (this._testFS.existsSync(path)) {
             return this._testFS.readFileSync(path, encoding);
         }
         return this._realFS.readFileSync(path, encoding);
     }
 
-    statSync(path: string): Stats {
+    statSync(path: Uri): Stats {
         if (this._testFS.existsSync(path)) {
             return this._testFS.statSync(path);
         }
         return this._realFS.statSync(path);
     }
 
-    realpathSync(path: string): string {
+    realpathSync(path: Uri): Uri {
         if (this._testFS.existsSync(path)) {
             return this._testFS.realpathSync(path);
         }
         return this._realFS.realpathSync(path);
     }
 
-    getModulePath(): string {
+    getModulePath(): Uri {
         return this._testFS.getModulePath();
     }
 
-    readFile(path: string): Promise<Buffer> {
+    readFile(path: Uri): Promise<Buffer> {
         if (this._testFS.existsSync(path)) {
             return this._testFS.readFile(path);
         }
         return this._realFS.readFile(path);
     }
 
-    readFileText(path: string, encoding?: BufferEncoding | undefined): Promise<string> {
+    readFileText(path: Uri, encoding?: BufferEncoding | undefined): Promise<string> {
         if (this._testFS.existsSync(path)) {
             return this._testFS.readFileText(path, encoding);
         }
         return this._realFS.readFileText(path, encoding);
     }
 
-    realCasePath(path: string): string {
+    realCasePath(path: Uri): Uri {
         return this._testFS.realCasePath(path);
     }
 
-    isMappedFilePath(filepath: string): boolean {
-        return this._testFS.isMappedFilePath(filepath);
+    isMappedUri(filepath: Uri): boolean {
+        return this._testFS.isMappedUri(filepath);
     }
 
-    getOriginalFilePath(mappedFilePath: string): string {
-        return this._testFS.getOriginalFilePath(mappedFilePath);
+    getOriginalUri(mappedFilePath: Uri): Uri {
+        return this._testFS.getOriginalUri(mappedFilePath);
     }
 
-    getMappedFilePath(originalFilepath: string): string {
-        return this._testFS.getMappedFilePath(originalFilepath);
+    getMappedUri(originalFilePath: Uri): Uri {
+        return this._testFS.getMappedUri(originalFilePath);
     }
 
-    getUri(path: string): string {
-        return this._testFS.getUri(path);
-    }
-
-    isInZip(path: string): boolean {
+    isInZip(path: Uri): boolean {
         return this._testFS.isInZip(path);
     }
 }

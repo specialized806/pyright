@@ -1,6 +1,6 @@
 # This sample tests the handling of type[T] and Type[T].
 
-from typing import Any, Type
+from typing import Any, Callable, Generic, Type, TypeVar
 
 
 def func1(t1: Type, t2: Type[Any], t3: type, t4: type[Any]):
@@ -92,3 +92,44 @@ def func4(t1: TA5, t2: TA6):
 
     reveal_type(t1.__sizeof__, expected_text="(self: object) -> int")
     reveal_type(t2.__sizeof__, expected_text="(self: object) -> int")
+
+
+T = TypeVar("T")
+
+TA7 = type[T]
+TA8 = Type[T]
+
+
+def func5(t1: TA7[T]) -> T:
+    return t1()
+
+
+def func6(t1: TA8[T]) -> T:
+    return t1()
+
+
+reveal_type(func5(int), expected_text="int")
+reveal_type(func6(int), expected_text="int")
+
+
+def func7(v: type):
+    x1: Callable[..., Any] = v
+    x2: Callable[[int, int], int] = v
+    x3: object = v
+    x4: type = v
+    x5: type[int] = v
+    x6: type[Any] = v
+
+
+class Class1(Generic[T]):
+    def method1(self, v: type) -> type[T]:
+        return v
+
+
+class Class2:
+    x1: type
+    x2: type[Any]
+
+
+reveal_type(Class2.x1, expected_text="type")
+reveal_type(Class2.x2, expected_text="type[Any]")

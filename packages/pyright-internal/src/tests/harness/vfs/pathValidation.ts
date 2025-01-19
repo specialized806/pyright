@@ -8,7 +8,7 @@ import { sep } from 'path';
 
 import * as pu from '../../../common/pathUtils';
 import { createIOError } from '../utils';
-import { URI } from 'vscode-uri';
+import { Uri } from '../../../common/uri/uri';
 
 const invalidRootComponentRegExp = getInvalidRootComponentRegExp();
 const invalidNavigableComponentRegExp = /[:*?"<>|]/;
@@ -124,17 +124,11 @@ function validateComponents(components: string[], flags: ValidationFlags, hasTra
     }
 
     // Validate component strings
-    if (pu.isUri(components[0])) {
-        try {
-            URI.parse(components[0]);
-        } catch {
-            return false;
-        }
-    } else if (invalidRootComponentRegExp.test(components[0])) {
+    if (invalidRootComponentRegExp.test(components[0])) {
         return false;
     }
     for (let i = 1; i < components.length; i++) {
-        if (invalidComponentRegExp.test(components[i])) {
+        if (invalidComponentRegExp.test(components[i]) && components[i] !== Uri.DefaultWorkspaceRootComponent) {
             return false;
         }
     }

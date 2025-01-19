@@ -25,44 +25,47 @@ import { CommandController } from './commands/commandController';
 import { getCancellationFolderName } from './common/cancellationUtils';
 import { ConfigOptions, SignatureDisplayType } from './common/configOptions';
 import { ConsoleWithLogLevel, LogLevel, convertLogLevel } from './common/console';
-import { isDebugMode, isString } from './common/core';
-import { expandPathVariables } from './common/envVarUtils';
+import { isDebugMode, isDefined, isString } from './common/core';
+import { resolvePathWithEnvVariables } from './common/envVarUtils';
 import { FileBasedCancellationProvider } from './common/fileBasedCancellationUtils';
+import { FileSystem } from './common/fileSystem';
 import { FullAccessHost } from './common/fullAccessHost';
 import { Host } from './common/host';
-import { realCasePath, resolvePaths } from './common/pathUtils';
+import { ServerSettings } from './common/languageServerInterface';
 import { ProgressReporter } from './common/progressReporter';
 import { RealTempFile, WorkspaceFileWatcherProvider, createFromRealFileSystem } from './common/realFileSystem';
 import { ServiceProvider } from './common/serviceProvider';
 import { createServiceProvider } from './common/serviceProviderExtensions';
-import { LanguageServerBase, ServerSettings } from './languageServerBase';
+import { Uri } from './common/uri/uri';
+import { getRootUri } from './common/uri/uriUtils';
+import { LanguageServerBase } from './languageServerBase';
 import { CodeActionProvider } from './languageService/codeActionProvider';
 import { PyrightFileSystem } from './pyrightFileSystem';
-import { Workspace } from './workspaceFactory';
+import { WellKnownWorkspaceKinds, Workspace } from './workspaceFactory';
 
 const maxAnalysisTimeInForeground = { openFilesTimeInMs: 50, noOpenFilesTimeInMs: 200 };
 
 export class PyrightServer extends LanguageServerBase {
     private _controller: CommandController;
 
-    constructor(connection: Connection) {
+    constructor(connection: Connection, maxWorkers: number, realFileSystem?: FileSystem) {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const version = require('../package.json').version || '';
+
+        const tempFile = new RealTempFile();
+        const console = new ConsoleWithLogLevel(connection.console);
+        const fileWatcherProvider = new WorkspaceFileWatcherProvider();
+        const fileSystem = realFileSystem ?? createFromRealFileSystem(tempFile, console, fileWatcherProvider);
+        const pyrightFs = new PyrightFileSystem(fileSystem);
+        const cacheManager = new CacheManager(maxWorkers);
+
+        const serviceProvider = createServiceProvider(pyrightFs, tempFile, console, cacheManager);
 
         // When executed from CLI command (pyright-langserver), __rootDirectory is
         // already defined. When executed from VSCode extension, rootDirectory should
         // be __dirname.
-        const rootDirectory = (global as any).__rootDirectory || __dirname;
-
-        const console = new ConsoleWithLogLevel(connection.console);
-        const fileWatcherProvider = new WorkspaceFileWatcherProvider();
-        const fileSystem = createFromRealFileSystem(console, fileWatcherProvider);
-        const pyrightFs = new PyrightFileSystem(fileSystem);
-        const tempFile = new RealTempFile();
-        const cacheManager = new CacheManager();
-
-        const serviceProvider = createServiceProvider(pyrightFs, tempFile, console, cacheManager);
-        const realPathRoot = realCasePath(rootDirectory, pyrightFs);
+        const rootDirectory: Uri = getRootUri(serviceProvider) || Uri.file(__dirname, serviceProvider);
+        const realPathRoot = pyrightFs.realCasePath(rootDirectory);
 
         super(
             {
@@ -89,8 +92,9 @@ export class PyrightServer extends LanguageServerBase {
             openFilesOnly: true,
             useLibraryCodeForTypes: true,
             disableLanguageServices: false,
+            disableTaggedHints: false,
             disableOrganizeImports: false,
-            typeCheckingMode: 'basic',
+            typeCheckingMode: 'standard',
             diagnosticSeverityOverrides: {},
             logLevel: LogLevel.Info,
             autoImportCompletions: true,
@@ -98,45 +102,34 @@ export class PyrightServer extends LanguageServerBase {
         };
 
         try {
-            const pythonSection = await this.getConfiguration(workspace.uri, 'python');
+            const workspaces = this.workspaceFactory.getNonDefaultWorkspaces(WellKnownWorkspaceKinds.Regular);
+
+            const pythonSection = await this.getConfiguration(workspace.rootUri, 'python');
             if (pythonSection) {
                 const pythonPath = pythonSection.pythonPath;
                 if (pythonPath && isString(pythonPath) && !isPythonBinary(pythonPath)) {
-                    serverSettings.pythonPath = resolvePaths(
-                        workspace.rootPath,
-                        expandPathVariables(workspace.rootPath, pythonPath)
-                    );
+                    serverSettings.pythonPath = resolvePathWithEnvVariables(workspace, pythonPath, workspaces);
                 }
 
                 const venvPath = pythonSection.venvPath;
-
                 if (venvPath && isString(venvPath)) {
-                    serverSettings.venvPath = resolvePaths(
-                        workspace.rootPath,
-                        expandPathVariables(workspace.rootPath, venvPath)
-                    );
+                    serverSettings.venvPath = resolvePathWithEnvVariables(workspace, venvPath, workspaces);
                 }
             }
 
-            const pythonAnalysisSection = await this.getConfiguration(workspace.uri, 'python.analysis');
+            const pythonAnalysisSection = await this.getConfiguration(workspace.rootUri, 'python.analysis');
             if (pythonAnalysisSection) {
                 const typeshedPaths = pythonAnalysisSection.typeshedPaths;
                 if (typeshedPaths && Array.isArray(typeshedPaths) && typeshedPaths.length > 0) {
                     const typeshedPath = typeshedPaths[0];
                     if (typeshedPath && isString(typeshedPath)) {
-                        serverSettings.typeshedPath = resolvePaths(
-                            workspace.rootPath,
-                            expandPathVariables(workspace.rootPath, typeshedPath)
-                        );
+                        serverSettings.typeshedPath = resolvePathWithEnvVariables(workspace, typeshedPath, workspaces);
                     }
                 }
 
                 const stubPath = pythonAnalysisSection.stubPath;
                 if (stubPath && isString(stubPath)) {
-                    serverSettings.stubPath = resolvePaths(
-                        workspace.rootPath,
-                        expandPathVariables(workspace.rootPath, stubPath)
-                    );
+                    serverSettings.stubPath = resolvePathWithEnvVariables(workspace, stubPath, workspaces);
                 }
 
                 const diagnosticSeverityOverrides = pythonAnalysisSection.diagnosticSeverityOverrides;
@@ -167,7 +160,8 @@ export class PyrightServer extends LanguageServerBase {
                 if (extraPaths && Array.isArray(extraPaths) && extraPaths.length > 0) {
                     serverSettings.extraPaths = extraPaths
                         .filter((p) => p && isString(p))
-                        .map((p) => resolvePaths(workspace.rootPath, expandPathVariables(workspace.rootPath, p)));
+                        .map((p) => resolvePathWithEnvVariables(workspace, p, workspaces))
+                        .filter(isDefined);
                 }
 
                 serverSettings.includeFileSpecs = this._getStringValues(pythonAnalysisSection.include);
@@ -196,7 +190,7 @@ export class PyrightServer extends LanguageServerBase {
                 serverSettings.autoSearchPaths = true;
             }
 
-            const pyrightSection = await this.getConfiguration(workspace.uri, 'pyright');
+            const pyrightSection = await this.getConfiguration(workspace.rootUri, 'pyright');
             if (pyrightSection) {
                 if (pyrightSection.openFilesOnly !== undefined) {
                     serverSettings.openFilesOnly = !!pyrightSection.openFilesOnly;
@@ -207,6 +201,7 @@ export class PyrightServer extends LanguageServerBase {
                 }
 
                 serverSettings.disableLanguageServices = !!pyrightSection.disableLanguageServices;
+                serverSettings.disableTaggedHints = !!pyrightSection.disableTaggedHints;
                 serverSettings.disableOrganizeImports = !!pyrightSection.disableOrganizeImports;
 
                 const typeCheckingMode = pyrightSection.typeCheckingMode;
@@ -227,11 +222,11 @@ export class PyrightServer extends LanguageServerBase {
             return undefined;
         }
 
-        return new BackgroundAnalysis(this.console);
+        return new BackgroundAnalysis(this.serverOptions.serviceProvider);
     }
 
-    protected override createHost() {
-        return new FullAccessHost(this.fs);
+    protected override createHost(): Host {
+        return new FullAccessHost(this.serverOptions.serviceProvider);
     }
 
     protected override createImportResolver(
@@ -256,21 +251,19 @@ export class PyrightServer extends LanguageServerBase {
         return this._controller.isLongRunningCommand(command);
     }
 
+    protected isRefactoringCommand(command: string): boolean {
+        return this._controller.isRefactoringCommand(command);
+    }
+
     protected async executeCodeAction(
         params: CodeActionParams,
         token: CancellationToken
     ): Promise<(Command | CodeAction)[] | undefined | null> {
         this.recordUserInteractionTime();
 
-        const filePath = this.uriParser.decodeTextDocumentUri(params.textDocument.uri);
-        const workspace = await this.getWorkspaceForFile(filePath);
-        return CodeActionProvider.getCodeActionsForPosition(
-            workspace,
-            filePath,
-            params.range,
-            params.context.only,
-            token
-        );
+        const uri = Uri.parse(params.textDocument.uri, this.serverOptions.serviceProvider);
+        const workspace = await this.getWorkspaceForFile(uri);
+        return CodeActionProvider.getCodeActionsForPosition(workspace, uri, params.range, params.context.only, token);
     }
 
     protected createProgressReporter(): ProgressReporter {

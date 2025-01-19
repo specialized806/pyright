@@ -8,7 +8,7 @@
 
 import { fail } from '../common/debug';
 import { ProgramView, SourceFileInfo } from '../common/extensibility';
-import { ServiceKeys } from '../common/serviceProviderExtensions';
+import { ServiceKeys } from '../common/serviceKeys';
 import { IPythonMode } from './sourceFile';
 
 export function isUserCode(fileInfo: SourceFileInfo | undefined) {
@@ -34,15 +34,15 @@ export function verifyNoCyclesInChainedFiles<T extends SourceFileInfo>(program: 
         return;
     }
 
-    const set = new Set<string>([fileInfo.sourceFile.getFilePath()]);
+    const set = new Set<string>([fileInfo.sourceFile.getUri().key]);
     while (nextChainedFile) {
-        const path = nextChainedFile.sourceFile.getFilePath();
+        const path = nextChainedFile.sourceFile.getUri().key;
         if (set.has(path)) {
             // We found a cycle.
             fail(
                 program.serviceProvider
                     .tryGet(ServiceKeys.debugInfoInspector)
-                    ?.getCycleDetail(program, nextChainedFile) ?? `Found a cycle in implicit imports files`
+                    ?.getCycleDetail(program, nextChainedFile) ?? `Found a cycle in implicit imports files for ${path}`
             );
         }
 
@@ -90,7 +90,7 @@ function _parseAllOpenCells(program: ProgramView): void {
             continue;
         }
 
-        program.getParseResults(file.sourceFile.getFilePath());
+        program.getParserOutput(file.sourceFile.getUri());
         program.handleMemoryHighUsage();
     }
 }

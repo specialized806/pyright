@@ -1,8 +1,12 @@
-# This sample tests the @typing.deprecated decorator introduced in PEP 702.
+# This sample tests the @warning.deprecated decorator introduced in PEP 702.
 
-from typing import Any, Callable, TypeVar
 from contextlib import contextmanager
-from typing_extensions import deprecated, overload
+from typing import Any, Callable, Self, TypeVar
+
+from typing_extensions import (  # pyright: ignore[reportMissingModuleSource]
+    deprecated,
+    overload,
+)
 
 
 @deprecated("Use ClassB instead")
@@ -93,6 +97,26 @@ ClassD(3)
 ClassD("")
 
 
+class ClassE:
+    @overload
+    def __new__(cls, x: int) -> Self:
+        ...
+
+    @overload
+    @deprecated("str no longer supported")
+    def __new__(cls, x: str) -> Self:
+        ...
+
+    def __new__(cls, x: int | str) -> Self:
+        ...
+
+
+ClassE(3)
+
+# This should generate an error if reportDeprecated is enabled.
+ClassE("")
+
+
 @deprecated("Deprecated async function")
 async def func3():
     ...
@@ -123,6 +147,9 @@ func5(1)
 
 # This should generate an error if reportDeprecated is enabled.
 func5("")
+
+# This should generate an error if reportDeprecated is enabled.
+v1 = func5
 
 
 T = TypeVar("T", bound=Callable[..., Any])

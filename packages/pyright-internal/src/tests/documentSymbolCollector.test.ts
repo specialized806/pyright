@@ -225,7 +225,7 @@ test('use localName import alias', () => {
     const references = state
         .getRangesByText()
         .get('tools')!
-        .map((r) => ({ path: r.fileName, range: state.convertPositionRange(r) }));
+        .map((r) => ({ uri: r.fileUri, range: state.convertPositionRange(r) }));
 
     state.verifyFindAllReferences({
         marker1: { references },
@@ -288,7 +288,7 @@ test('use localName import module', () => {
     const references = state
         .getRangesByText()
         .get('tools')!
-        .map((r) => ({ path: r.fileName, range: state.convertPositionRange(r) }));
+        .map((r) => ({ uri: r.fileUri, range: state.convertPositionRange(r) }));
 
     state.verifyFindAllReferences({
         marker1: { references },

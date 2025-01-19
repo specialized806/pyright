@@ -93,12 +93,10 @@ def func7(val: Any):
     reveal_type(val, expected_text="int | Any")
 
 
-class CParent:
-    ...
+class CParent: ...
 
 
-class CChild(CParent):
-    ...
+class CChild(CParent): ...
 
 
 _TC = TypeVar("_TC", bound=CParent)
@@ -124,6 +122,17 @@ class G(str):
     @classmethod
     def method1(cls, v: str):
         if type(v) is cls:
-            reveal_type(v, expected_text="G")
+            reveal_type(v, expected_text="G*")
         else:
             reveal_type(v, expected_text="str")
+
+
+class H:
+    def __init__(self, x): ...
+
+
+def func9[T: H](x: type[T], y: H) -> T:
+    if type(y) == x:
+        reveal_type(y, expected_text="H*")
+        return y
+    return x(y)
